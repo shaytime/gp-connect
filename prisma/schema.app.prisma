@@ -1,0 +1,18 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/app"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("APP_DATABASE_URL")
+}
+
+model UserPreference {
+  id        Int      @id @default(autoincrement())
+  userId    String   @unique
+  theme     String   @default("light")
+  favorites String[] // List of GP Customer IDs
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}

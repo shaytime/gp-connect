@@ -1,0 +1,22 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/gp"
+}
+
+datasource db {
+  provider = "sqlserver"
+  url      = env("GP_DATABASE_URL")
+}
+
+// Dynamics GP Customer Master
+model Customer {
+  id       String @id @map("CUSTNMBR")
+  name     String @map("CUSTNAME")
+  address1 String @map("ADDRESS1")
+  address2 String @map("ADDRESS2")
+  city     String @map("CITY")
+  state    String @map("STATE")
+  zipCode  String @map("ZIP")
+
+  @@map("RM00101")
+}

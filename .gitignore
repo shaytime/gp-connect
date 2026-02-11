@@ -31,3 +31,23 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# diagnostic scripts and temporary files
+/*.js
+/*.cjs
+/*.ts
+/*.txt
+/*.json
+!/package.json
+!/package-lock.json
+!/tsconfig.json
+!/next.config.js
+!/postcss.config.js
+!/tailwind.config.*
+!/next-env.d.ts
+
+# prisma generated
+/src/generated/
+/prisma/migrations/
+/prisma/dev.db
+/prisma/dev.db-journal
