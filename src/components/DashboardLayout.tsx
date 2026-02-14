@@ -11,6 +11,7 @@ import {
     User,
     LogOut,
     ChevronRight,
+    ChevronDown,
     FileText
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -29,7 +30,15 @@ export default function DashboardLayout({ children, breadcrumbs }: DashboardLayo
         { label: "Sales Orders", href: "/", icon: ShoppingCart },
         { label: "Invoices", href: "/invoices", icon: FileText },
         { label: "Customers", href: "/customers", icon: User },
-        { label: "Inventory", href: "/inventory", icon: Package },
+        {
+            label: "Inventory",
+            href: "/inventory",
+            icon: Package,
+            items: [
+                { label: "Stock Overview", href: "/inventory" },
+                { label: "Inventory Tracking", href: "/inventory/tracking" },
+            ]
+        },
     ];
 
     return (
@@ -45,13 +54,27 @@ export default function DashboardLayout({ children, breadcrumbs }: DashboardLayo
 
                 <nav className="flex-1 px-4 space-y-1">
                     {navigation.map((item) => (
-                        <SidebarItem
-                            key={item.label}
-                            icon={<item.icon size={20} />}
-                            label={item.label}
-                            href={item.href}
-                            active={pathname === item.href}
-                        />
+                        <div key={item.label} className="space-y-1">
+                            <SidebarItem
+                                icon={<item.icon size={20} />}
+                                label={item.label}
+                                href={item.href}
+                                active={pathname === item.href || (item.items?.some(sub => pathname === sub.href) ?? false)}
+                                hasSubItems={!!item.items}
+                            />
+                            {item.items && (
+                                <div className="ml-9 space-y-1 pb-2">
+                                    {item.items.map(subItem => (
+                                        <SubItem
+                                            key={subItem.label}
+                                            label={subItem.label}
+                                            href={subItem.href}
+                                            active={pathname === subItem.href}
+                                        />
+                                    ))}
+                                </div>
+                            )}
+                        </div>
                     ))}
                 </nav>
 
@@ -111,12 +134,14 @@ function SidebarItem({
     icon,
     label,
     href,
-    active = false
+    active = false,
+    hasSubItems = false
 }: {
     icon: React.ReactNode;
     label: string;
     href: string;
     active?: boolean;
+    hasSubItems?: boolean;
 }) {
     return (
         <Link
@@ -129,6 +154,34 @@ function SidebarItem({
             )}
         >
             {icon}
+            <span className="flex-1">{label}</span>
+            {hasSubItems && (
+                <ChevronDown size={14} className={cn("transition-transform duration-200", active ? "rotate-0" : "-rotate-90 opacity-40")} />
+            )}
+        </Link>
+    );
+}
+
+function SubItem({
+    label,
+    href,
+    active = false
+}: {
+    label: string,
+    href: string,
+    active?: boolean
+}) {
+    return (
+        <Link
+            href={href}
+            className={cn(
+                "flex items-center gap-3 w-full px-3 py-2 rounded-lg transition-all text-xs font-bold uppercase tracking-wider",
+                active
+                    ? "text-primary bg-primary/5"
+                    : "text-slate-400 hover:bg-slate-50 hover:text-slate-600"
+            )}
+        >
+            <div className={cn("w-1.5 h-1.5 rounded-full", active ? "bg-primary" : "bg-slate-200 group-hover:bg-slate-300")} />
             <span>{label}</span>
         </Link>
     );

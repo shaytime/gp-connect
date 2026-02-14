@@ -25,7 +25,7 @@ function InventoryContent() {
     const page = parseInt(searchParams.get("page") || "1");
     const sort = searchParams.get("sort") || "ITEMNMBR";
     const order = (searchParams.get("order") || "ASC").toUpperCase() as 'ASC' | 'DESC';
-    const hideZero = searchParams.get("hideZero") === "true";
+    const hideZero = searchParams.get("hideZero") !== "false";
 
     useEffect(() => {
         fetchFilters();

@@ -16,3 +16,35 @@ model UserPreference {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
+
+model SerialReservation {
+  id           Int      @id @default(autoincrement())
+  itemNumber   String
+  serialNumber String
+  reservedBy   String   // User email/ID
+  userName     String?  // Friendly name for display
+  expiresAt    DateTime
+  createdAt    DateTime @default(now())
+
+  @@unique([itemNumber, serialNumber])
+  @@index([itemNumber])
+}
+
+model SfOrder {
+  id              String   @id @default(uuid())
+  sfId            String   @unique // Salesforce Record ID
+  orderNumber     String   @unique // Salesforce Order Number
+  gpOrderNumber   String?  // Linked GP Order Number
+  execYear        Int?     // Execution Year
+  execMonth       Int?     // Execution Month
+  accountName     String?
+  totalAmount     Decimal  @default(0) @db.Decimal(18, 2)
+  modality             String?
+  requiredDeliveryDate DateTime?
+  netAmount            Decimal  @default(0) @db.Decimal(18, 2)
+  grossAmount          Decimal  @default(0) @db.Decimal(18, 2)
+  status               String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  lastSyncedAt    DateTime @default(now())
+}

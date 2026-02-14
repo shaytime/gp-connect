@@ -9,7 +9,7 @@ export async function GET(req: NextRequest) {
         const q = searchParams.get("q") || "";
         const classIds = searchParams.get("classIds")?.split(",").filter(Boolean) || [];
         const siteId = searchParams.get("siteId") || "";
-        const hideZero = searchParams.get("hideZero") === "true";
+        const hideZero = searchParams.get("hideZero") !== "false";
         const page = parseInt(searchParams.get("page") || "1");
         const limit = parseInt(searchParams.get("limit") || "20");
         const offset = (page - 1) * limit;

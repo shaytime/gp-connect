@@ -1,7 +1,9 @@
 "use server";
 
-import { prismaGP } from "@/lib/db";
+import { prismaGP, prismaApp } from "@/lib/db";
 import { unstable_noStore as noStore } from "next/cache";
+import { cleanupExpiredReservations } from "../inventory/reservation-actions";
+import { auth } from "@/auth";
 
 export async function getCustomerDetails(customerId: string) {
     try {
@@ -29,14 +31,22 @@ export async function getCustomerDetails(customerId: string) {
         const billTo = addresses.find(a => a.ADRSCODE.trim() === customer.PRBTADCD.trim());
         const shipTo = addresses.find(a => a.ADRSCODE.trim() === customer.PRSTADCD.trim());
 
-        // 3. Calculate Open AR (Subtotal: Invoices/Debits - Credits/Payments)
+        // 3. Calculate Open AR and Overdue AR
         const arResult = await prismaGP.$queryRawUnsafe<any[]>(
-            `SELECT SUM(
-                CASE 
-                    WHEN RMDTYPAL >= 7 THEN -CURTRXAM 
-                    ELSE CURTRXAM 
-                END
-             ) as TotalAR 
+            `SELECT 
+                SUM(
+                    CASE 
+                        WHEN RMDTYPAL >= 7 THEN -CURTRXAM 
+                        ELSE CURTRXAM 
+                    END
+                ) as TotalAR,
+                SUM(
+                    CASE 
+                        WHEN RMDTYPAL < 7 AND DUEDATE < GETDATE() THEN CURTRXAM 
+                        WHEN RMDTYPAL >= 7 AND DUEDATE < GETDATE() THEN -CURTRXAM
+                        ELSE 0 
+                    END
+                ) as OverdueAR
              FROM RM20101 
              WHERE CUSTNMBR = @P1 AND VOIDSTTS = 0`,
             customerId
@@ -65,7 +75,8 @@ export async function getCustomerDetails(customerId: string) {
                 zip: shipTo.ZIP.trim(),
                 country: shipTo.COUNTRY.trim()
             } : null,
-            openAR: Number(arResult[0]?.TotalAR || 0)
+            openAR: Number(arResult[0]?.TotalAR || 0),
+            overdueAR: Number(arResult[0]?.OverdueAR || 0)
         };
     } catch (error) {
         console.error("Error fetching customer details:", error);
@@ -443,6 +454,8 @@ export async function getCustomerAddresses(customerId: string) {
 
 export async function searchProducts(query: string, siteId: string = 'MAIN') {
     try {
+        const isAllSites = siteId === 'ALL';
+
         // Helper to tokenize search query respecting quotes
         const getAndGroups = (q: string) => {
             const groups: string[] = [];
@@ -481,34 +494,84 @@ export async function searchProducts(query: string, siteId: string = 'MAIN') {
             return terms.filter(Boolean);
         };
 
-        let builderSql = `
-            SELECT TOP 15 p.ITEMNMBR, p.ITEMDESC, p.CURRCOST, 
-                   COALESCE(q.QTYONHND, 0) as QTYONHND, 
-                   COALESCE(q.ATYALLOC, 0) as ATYALLOC
-            FROM IV00101 p
-            LEFT JOIN IV00102 q ON p.ITEMNMBR = q.ITEMNMBR AND q.LOCNCODE = @P1
-            WHERE p.ITEMTYPE = 1
-        `;
-        const builderParams: any[] = [siteId];
-        let pIdx = 2; // Start from 2 since P1 is siteId
+        let builderSql = "";
+        const builderParams: any[] = [];
+        let pIdx = 1;
+
+        // Note: Removing p.ITEMTYPE = 1 to allow searching service/other items
+        if (isAllSites) {
+            builderSql = `
+                SELECT TOP 15 p.ITEMNMBR, p.ITEMDESC, p.CURRCOST, p.ITMTRKOP,
+                       (SELECT SUM(QTYONHND) FROM IV00102 WHERE ITEMNMBR = p.ITEMNMBR) as QTYONHND, 
+                       (SELECT SUM(ATYALLOC) FROM IV00102 WHERE ITEMNMBR = p.ITEMNMBR) as ATYALLOC
+                FROM IV00101 p
+                WHERE 1=1
+            `;
+        } else {
+            builderSql = `
+                SELECT TOP 15 p.ITEMNMBR, p.ITEMDESC, p.CURRCOST, p.ITMTRKOP,
+                       COALESCE(q.QTYONHND, 0) as QTYONHND, 
+                       COALESCE(q.ATYALLOC, 0) as ATYALLOC
+                FROM IV00101 p
+                LEFT JOIN IV00102 q ON p.ITEMNMBR = q.ITEMNMBR AND q.LOCNCODE = @P1
+                WHERE 1=1
+            `;
+            builderParams.push(siteId);
+            pIdx = 2;
+        }
 
         if (query) {
             const andGroups = getAndGroups(query);
-            andGroups.forEach((group) => {
+            const cteNames: string[] = [];
+            const cteDefinitions: string[] = [];
+
+            andGroups.forEach((group, gIdx) => {
                 const orTerms = getOrTerms(group);
                 if (orTerms.length > 0) {
-                    const orConditions = orTerms
-                        .map((term) => {
-                            builderParams.push(`%${term}%`);
-                            return `(p.ITEMNMBR LIKE @P${pIdx++} OR p.ITEMDESC LIKE @P${pIdx - 1})`;
-                        })
-                        .join(" OR ");
-                    builderSql += ` AND (${orConditions})`;
+                    const cteName = `TokenMatch${gIdx}`;
+                    cteNames.push(cteName);
+
+                    const unionQueries = orTerms.map((term) => {
+                        let value = term;
+                        let isExact = false;
+
+                        if (value.startsWith('"') && value.endsWith('"')) {
+                            value = value.substring(1, value.length - 1);
+                            isExact = true;
+                        }
+
+                        const pSc = pIdx++;
+                        const finalValue = isExact ? value : `%${value}%`;
+                        const op = isExact ? '=' : 'LIKE';
+                        builderParams.push(finalValue);
+
+                        return `SELECT ITEMNMBR FROM IV00101 WHERE ITEMNMBR ${op} @P${pSc} OR ITEMDESC ${op} @P${pSc}
+                                UNION
+                                SELECT ITEMNMBR FROM IV00200 WHERE SERLNMBR ${op} @P${pSc}
+                                UNION
+                                SELECT ITEMNMBR FROM IV30400 WHERE SERLTNUM ${op} @P${pSc}
+                                UNION
+                                SELECT ITEMNMBR FROM SOP10201 WHERE SERLTNUM ${op} @P${pSc}`;
+                    });
+
+                    cteDefinitions.push(`${cteName} AS (
+                        ${unionQueries.join("\n                        UNION\n                        ")}
+                    )`);
                 }
             });
+
+            if (cteDefinitions.length > 0) {
+                builderSql = `WITH ${cteDefinitions.join(",\n")} ${builderSql}`;
+                const intersectClause = cteNames.map(name => `p.ITEMNMBR IN (SELECT ITEMNMBR FROM ${name})`).join(" AND ");
+                builderSql += ` AND (${intersectClause})`;
+            }
         }
 
-        builderSql += ` ORDER BY (COALESCE(q.QTYONHND, 0) - COALESCE(q.ATYALLOC, 0)) DESC, p.ITEMNMBR ASC`;
+        const sortStockColumn = isAllSites
+            ? `(SELECT SUM(QTYONHND - ATYALLOC) FROM IV00102 WHERE ITEMNMBR = p.ITEMNMBR)`
+            : `(COALESCE(q.QTYONHND, 0) - COALESCE(q.ATYALLOC, 0))`;
+
+        builderSql += ` ORDER BY ${sortStockColumn} DESC, p.ITEMNMBR ASC`;
 
         const results = await prismaGP.$queryRawUnsafe<any[]>(builderSql, ...builderParams);
 
@@ -557,28 +620,30 @@ export async function searchSalesOrders(query: string) {
         let errors: string[] = [];
 
         // Search in Work (SOP10100)
-        const workResults = await prismaGP.$queryRawUnsafe<any[]>(
-            `SELECT TOP 10 SOPNUMBE, CUSTNMBR, CUSTNAME, DOCDATE, SOPTYPE, BACHNUMB, CSTPONBR
+        const workResultsRaw = await prismaGP.$queryRawUnsafe<any[]>(
+            `SELECT TOP 10 SOPNUMBE, CUSTNMBR, CUSTNAME, DOCDATE, SOPTYPE, BACHNUMB, CSTPONBR, DOCAMNT
              FROM SOP10100 
-             WHERE SOPNUMBE LIKE @P1 OR CUSTNAME LIKE @P1
+             WHERE SOPNUMBE LIKE @P1 OR CUSTNAME LIKE @P1 OR CSTPONBR LIKE @P1
              ORDER BY DOCDATE DESC`,
             searchPattern
         ).catch(err => {
             errors.push("Work Table: " + err.message);
             return [];
         });
+        const workResults = workResultsRaw.map(r => ({ ...r, IS_HISTORY: false }));
 
         // Search in History (SOP30200)
-        const historyResults = await prismaGP.$queryRawUnsafe<any[]>(
-            `SELECT TOP 10 SOPNUMBE, CUSTNMBR, CUSTNAME, DOCDATE, SOPTYPE, CSTPONBR
+        const historyResultsRaw = await prismaGP.$queryRawUnsafe<any[]>(
+            `SELECT TOP 10 SOPNUMBE, CUSTNMBR, CUSTNAME, DOCDATE, SOPTYPE, CSTPONBR, DOCAMNT
              FROM SOP30200 
-             WHERE SOPNUMBE LIKE @P1 OR CUSTNAME LIKE @P1
+             WHERE SOPNUMBE LIKE @P1 OR CUSTNAME LIKE @P1 OR CSTPONBR LIKE @P1
              ORDER BY DOCDATE DESC`,
             searchPattern
         ).catch(err => {
             errors.push("History Table: " + err.message);
             return [];
         });
+        const historyResults = historyResultsRaw.map(r => ({ ...r, IS_HISTORY: true }));
 
         // Merge and deduplicate
         const merged = [...workResults, ...historyResults];
@@ -592,13 +657,147 @@ export async function searchSalesOrders(query: string) {
                 customerName: (o.CUSTNAME || "").trim(),
                 date: o.DOCDATE,
                 poNumber: (o.CSTPONBR || "").trim(),
-                type: o.SOPTYPE
+                type: o.SOPTYPE,
+                totalAmount: Number(o.DOCAMNT || 0),
+                isHistory: o.IS_HISTORY
             })).slice(0, 15),
             error: errors.length > 0 ? errors.join(" | ") : null
         };
     } catch (error: any) {
         console.error("Error searching Sales Orders:", error);
         return { results: [], error: error.message };
+    }
+}
+
+
+
+export async function getAllocationData(itemNumber: string, siteId: string, currentSopNumber?: string, currentSopType?: number, guestId?: string) {
+    try {
+        const session = await auth();
+        const userId = session?.user?.email || (session?.user as any)?.id || guestId || "anonymous";
+        const tItem = (itemNumber || "").trim();
+        const tSite = (siteId || "").trim();
+        const tSop = (currentSopNumber || "").trim();
+        console.log(`[Allocation] Start: Item="${tItem}", Site="${tSite}", CurrentSOP="${tSop}"`);
+
+        // Layer 1: Check Item Master for Tracking Option
+        let iv00101 = await prismaGP.$queryRawUnsafe<any[]>(
+            `SELECT ITEMNMBR, ITMTRKOP FROM IV00101 WHERE UPPER(LTRIM(RTRIM(ITEMNMBR))) = UPPER(@P1)`,
+            tItem
+        );
+
+        if (iv00101.length === 0) {
+            console.log(`[Allocation] Exact match failed for "${tItem}". Trying LIKE...`);
+            iv00101 = await prismaGP.$queryRawUnsafe<any[]>(
+                `SELECT TOP 1 ITEMNMBR, ITMTRKOP FROM IV00101 WHERE ITEMNMBR LIKE @P1`,
+                `%${tItem}%`
+            );
+        }
+
+        console.log(`[Allocation] IV00101 query matches: ${iv00101.length}`);
+
+        let tracking = 1; // Default
+        if (iv00101.length > 0) {
+            const rawItem = iv00101[0];
+            console.log(`[Allocation] IV00101 Full Data:`, JSON.stringify(rawItem));
+            const itmTrkOp = rawItem.ITMTRKOP ?? rawItem.itmtrkop ?? rawItem.Itmtrkop;
+            tracking = Number(itmTrkOp ?? 1);
+            console.log(`[Allocation] Tracking parsed as: ${tracking} from raw: ${itmTrkOp}`);
+        } else {
+            console.warn(`[Allocation] Item "${tItem}" NOT FOUND in IV00101 even with LIKE fallback.`);
+        }
+
+        // Layer 2: Fetch Serials for this site (Authority for Serialized Items)
+        // We fetch ALL serials and their SOP Work allocation status (if any)
+        const serialsRes = await prismaGP.$queryRawUnsafe<any[]>(
+            `SELECT 
+                iv.SERLNMBR, 
+                iv.DATERECD,
+                (SELECT TOP 1 SOPNUMBE FROM SOP10201 
+                 WHERE LTRIM(RTRIM(SERLTNUM)) = LTRIM(RTRIM(iv.SERLNMBR)) 
+                 AND LTRIM(RTRIM(ITEMNMBR)) = LTRIM(RTRIM(iv.ITEMNMBR))) as ALLOCATED_SOP
+             FROM IV00200 iv
+             WHERE UPPER(LTRIM(RTRIM(iv.ITEMNMBR))) = UPPER(@P1) 
+               AND UPPER(LTRIM(RTRIM(iv.LOCNCODE))) = UPPER(@P2) 
+               AND iv.SERLNSLD = 0
+             ORDER BY iv.DATERECD ASC`,
+            tItem, tSite
+        );
+
+        // Fetch Reservations from prismaApp
+        let reservations: any[] = [];
+        try {
+            await cleanupExpiredReservations();
+            reservations = await (prismaApp as any).serialReservation.findMany({
+                where: { itemNumber: tItem }
+            });
+        } catch (reserveError) {
+            console.warn("[Allocation] Could not fetch reservations (client/table may be out of sync):", reserveError);
+        }
+
+        const serials = serialsRes.map(s => {
+            const sn = (s.SERLNMBR || "").trim();
+            const reservation = reservations.find(r => r.serialNumber === sn);
+            const allocatedSop = (s.ALLOCATED_SOP || "").trim();
+
+            return {
+                serialNumber: sn,
+                agingDays: Math.ceil(Math.abs(new Date().getTime() - new Date(s.DATERECD).getTime()) / (1000 * 60 * 60 * 24)),
+                receiptDate: s.DATERECD ? s.DATERECD.toISOString() : new Date().toISOString(),
+                reservedBy: reservation?.reservedBy || null,
+                reservedByName: reservation?.userName || null,
+                isReservedByMe: reservation?.reservedBy === userId,
+                allocatedToSopNumber: allocatedSop || null,
+                isAllocatedByOtherOrder: allocatedSop !== "" && allocatedSop !== tSop
+            };
+        });
+        console.log(`[Allocation] Site Serials Found: ${serials.length}`);
+
+        // Layer 3: GLOBAL Serial Check (Safety Net for misconfigured Item Master)
+        if (tracking !== 2 && serials.length > 0) {
+            console.warn(`[Allocation] Found serials but master said tracking=${tracking}. Forcing Serialized.`);
+            tracking = 2;
+        } else if (tracking !== 2) {
+            const globalSerialCheck = await prismaGP.$queryRawUnsafe<any[]>(
+                `SELECT TOP 1 SERLNMBR FROM IV00200 WHERE UPPER(LTRIM(RTRIM(ITEMNMBR))) = UPPER(@P1) AND SERLNSLD = 0`,
+                tItem
+            );
+            if (globalSerialCheck.length > 0) {
+                console.warn(`[Allocation] Item found in IV00200 globally. Forcing Serialized.`);
+                tracking = 2;
+            }
+        }
+
+        // Layer 4: Fetch Site Stock (Authority for Non-Serialized Items)
+        const siteStock = await prismaGP.$queryRawUnsafe<any[]>(
+            `SELECT QTYONHND, ATYALLOC FROM IV00102 WHERE UPPER(LTRIM(RTRIM(ITEMNMBR))) = UPPER(@P1) AND UPPER(LTRIM(RTRIM(LOCNCODE))) = UPPER(@P2)`,
+            tItem, tSite
+        );
+        const onHand = Number(siteStock[0]?.QTYONHND || 0);
+        const allocated = Number(siteStock[0]?.ATYALLOC || 0);
+
+        // Final Calculation
+        let available = Math.max(0, onHand - allocated);
+        if (tracking === 2) {
+            // AUTHORITATIVE for Serialized: The actual count of available serials
+            available = serials.length;
+        }
+        console.log(`[Allocation] Site Available Calc: ${available} (TableStock=${onHand - allocated}, SerialsCount=${serials.length})`);
+
+        // Layer 5: Warehouse-Wide Availability (REMOVED for performance)
+        const totalAvail = 0;
+        console.log(`[Allocation] Total Avail Calc: SKIP (Performance Optimization)`);
+
+        return {
+            trackingOption: tracking,
+            availableQty: available,
+            totalAvailableAcrossSites: totalAvail,
+            qtyOnHand: onHand,
+            serials
+        };
+    } catch (error) {
+        console.error("Error in getAllocationData:", error);
+        throw new Error("Allocation data error");
     }
 }
 
@@ -638,15 +837,15 @@ export async function getSalesOrderDetails(orderNumber: string, sopType?: number
         const customerId = h.CUSTNMBR.trim();
 
         // 2. Fetch progressive header data (separate tries for optional columns)
-        let metadata = await prismaGP.$queryRawUnsafe<any[]>(
-            `SELECT * FROM ${tableUsed} WHERE SOPNUMBE = @P1 AND SOPTYPE = @P2`,
-            orderNumber, actualSopType
-        ).catch(async (e) => {
-            console.error(`[Diagnostic] SELECT * failed for ${tableUsed}:`, e.message);
+        const metadata = await prismaGP.$queryRawUnsafe<any[]>(
+            `SELECT * FROM ${tableUsed} WHERE RTRIM(SOPNUMBE) = @P1 AND SOPTYPE = @P2`,
+            orderNumber.trim(), actualSopType
+        ).catch(async (err) => {
+            console.error(`[Diagnostic] Metadata fetch failed on ${tableUsed} for ${orderNumber}:`, err.message);
             return await prismaGP.$queryRawUnsafe<any[]>(
                 `SELECT CUSTNAME, PRBTADCD, PRSTADCD, LOCNCODE, DOCDATE, BACHNUMB, TRDISAMT, TAXSCHID
-                 FROM ${tableUsed} WHERE SOPNUMBE = @P1 AND SOPTYPE = @P2`,
-                orderNumber, actualSopType
+                 FROM ${tableUsed} WHERE RTRIM(SOPNUMBE) = @P1 AND SOPTYPE = @P2`,
+                orderNumber.trim(), actualSopType
             ).catch(() => []);
         });
 
@@ -657,18 +856,40 @@ export async function getSalesOrderDetails(orderNumber: string, sopType?: number
         // Find PO Number (try multiple potential column names just in case)
         const poNum = m.CSTPONBR || m.CUSTPO || m.PONUMBER || m.PO_Number || m.CUST_PO_Number || "";
 
+        // 2.5 Fetch Serial Numbers for the entire order
+        const serialTable = isHistory ? 'SOP30301' : 'SOP10201';
+        console.log(`[Diagnostic] Fetching Serials from ${serialTable} for Order=${orderNumber}, Type=${actualSopType}`);
+        const orderSerials = await prismaGP.$queryRawUnsafe<any[]>(
+            `SELECT LNITMSEQ, SERLTNUM FROM ${serialTable} WHERE RTRIM(SOPNUMBE) = @P1 AND SOPTYPE = @P2`,
+            orderNumber.trim(), actualSopType
+        ).catch(() => []);
+
+        // Group serial numbers by LNITMSEQ
+        const serialMap: Record<number, string[]> = {};
+        orderSerials.forEach(s => {
+            const seq = Number(s.LNITMSEQ);
+            if (!serialMap[seq]) serialMap[seq] = [];
+            serialMap[seq].push((s.SERLTNUM || "").trim());
+            console.log(`[Diagnostic] Mapped SN: ${s.SERLTNUM.trim()} to Seq: ${seq}`);
+        });
+
         // 3. Fetch Lines
         const lineTable = isHistory ? 'SOP30300' : 'SOP10200';
         const lines = await prismaGP.$queryRawUnsafe<any[]>(
-            `SELECT * FROM ${lineTable} WHERE SOPNUMBE = @P1 AND SOPTYPE = @P2 ORDER BY LNITMSEQ`,
-            orderNumber, actualSopType
+            `SELECT *, ATYALLOC, QTYFULFI FROM ${lineTable} WHERE RTRIM(SOPNUMBE) = @P1 AND SOPTYPE = @P2 ORDER BY LNITMSEQ`,
+            orderNumber.trim(), actualSopType
         ).catch(async (err) => {
             console.error(`[Diagnostic] SELECT * for lines failed on ${lineTable}:`, err.message);
             return await prismaGP.$queryRawUnsafe<any[]>(
-                `SELECT ITEMNMBR, ITEMDESC, QUANTITY, UNITPRCE, UNITCOST, UOFM, LOCNCODE
-                 FROM ${lineTable} WHERE SOPNUMBE = @P1 AND SOPTYPE = @P2 ORDER BY LNITMSEQ`,
-                orderNumber, actualSopType
+                `SELECT ITEMNMBR, ITEMDESC, QUANTITY, UNITPRCE, UNITCOST, UOFM, LOCNCODE, ATYALLOC, QTYFULFI, LNITMSEQ
+                 FROM ${lineTable} WHERE RTRIM(SOPNUMBE) = @P1 AND SOPTYPE = @P2 ORDER BY LNITMSEQ`,
+                orderNumber.trim(), actualSopType
             ).catch(() => []);
+        });
+
+        console.log(`[Diagnostic] Found ${lines.length} lines for ${orderNumber}`);
+        lines.forEach(l => {
+            console.log(`[Diagnostic] Line: Item=${l.ITEMNMBR.trim()}, Seq=${l.LNITMSEQ}, QTYFULFI=${l.QTYFULFI}`);
         });
 
         // 4. Get Customer Details
@@ -689,7 +910,9 @@ export async function getSalesOrderDetails(orderNumber: string, sopType?: number
                 batch: (m.BACHNUMB || "").trim(),
                 poNumber: (poNum + "").trim(),
                 tradeDiscount: Number(m.TRDISAMT || 0),
-                taxScheduleId: (m.TAXSCHID || "").trim()
+                taxScheduleId: (m.TAXSCHID || "").trim(),
+                sopType: actualSopType,
+                isHistory: isHistory
             },
             customer: customerFull.length > 0 ? {
                 id: customerFull[0].CUSTNMBR.trim(),
@@ -707,14 +930,85 @@ export async function getSalesOrderDetails(orderNumber: string, sopType?: number
                 total: Number(l.QUANTITY || 0) * Number(l.UNITPRCE || 0),
                 uom: (l.UOFM || "").trim(),
                 siteId: (l.LOCNCODE || "").trim(),
+                qtyAllocated: Number(l.ATYALLOC || 0),
+                qtyFulfilled: Number(l.QTYFULFI || 0),
+                serialNumbers: serialMap[Number(l.LNITMSEQ)] || [],
+                // We'll treat all linked serials as fulfilled if qtyFulfilled > 0 for now, 
+                // or more logically, the first N serials where N = qtyFulfilled
+                fulfilledSerialNumbers: (serialMap[Number(l.LNITMSEQ)] || []).slice(0, Number(l.QTYFULFI || 0)),
                 // UI Specific fields
                 priceLevel: (l.PRCLEVEL || 'STD').trim(),
                 shipToAddressId: (l.PRSTADCD || m.PRSTADCD || "").trim(),
-                markdown: Number(l.MRKDNAMT || 0)
+                markdown: Number(l.MRKDNAMT || 0),
+                taxScheduleId: (l.TAXSCHID || "").trim()
             }))
         };
     } catch (error: any) {
         console.error("Critical error in getSalesOrderDetails:", error);
         throw new Error("Unable to retrieve order details from GP. Please check DB logs.");
+    }
+}
+
+export async function getInvoicePaymentStatus(docNumber: string) {
+    try {
+        const tDoc = (docNumber || "").trim();
+        console.log(`[getInvoicePaymentStatus] Fetching for: ${tDoc}`);
+
+        // 1. Get Main Document Info (Look in Open RM first, then History)
+        let docInfo = await prismaGP.$queryRawUnsafe<any[]>(
+            `SELECT DOCNUMBR, ORTRXAMT, CURTRXAM, DOCDATE, RMDTYPAL, CUSTNMBR FROM RM20101 WHERE LTRIM(RTRIM(DOCNUMBR)) = @P1`,
+            tDoc
+        );
+
+        if (docInfo.length === 0) {
+            docInfo = await prismaGP.$queryRawUnsafe<any[]>(
+                `SELECT DOCNUMBR, ORTRXAMT, CURTRXAM, DOCDATE, RMDTYPAL, CUSTNMBR FROM RM30101 WHERE LTRIM(RTRIM(DOCNUMBR)) = @P1`,
+                tDoc
+            );
+        }
+
+        if (docInfo.length === 0) {
+            console.log(`[getInvoicePaymentStatus] Document ${tDoc} not found in RM tables.`);
+            return null;
+        }
+
+        const main = docInfo[0];
+        const totalAmount = Number(main.ORTRXAMT || 0);
+        const amountRemaining = Number(main.CURTRXAM || 0);
+
+        // 2. Get Applied Payments/Credits (Use UNION to deduplicate if record exists in both tables)
+        const applications = await prismaGP.$queryRawUnsafe<any[]>(
+            `SELECT APFRDCNM, APPTOAMT, DATE1, APFRDCTY 
+             FROM (
+                SELECT APFRDCNM, APPTOAMT, DATE1, APFRDCTY FROM RM20201 WHERE LTRIM(RTRIM(APTODCNM)) = @P1
+                UNION
+                SELECT APFRDCNM, APPTOAMT, DATE1, APFRDCTY FROM RM30201 WHERE LTRIM(RTRIM(APTODCNM)) = @P1
+             ) app`,
+            tDoc
+        );
+
+        const typeMapping: Record<number, string> = {
+            7: "Credit Memo",
+            8: "Return",
+            9: "Payment"
+        };
+
+        return {
+            docNumber: tDoc,
+            customerNumber: (main.CUSTNMBR || "").trim(),
+            totalAmount,
+            amountRemaining,
+            amountPaid: totalAmount - amountRemaining,
+            payments: applications.map(app => ({
+                docNumber: (app.APFRDCNM || "").trim(),
+                date: app.DATE1,
+                amountApplied: Number(app.APPTOAMT || 0),
+                type: typeMapping[app.APFRDCTY] || `Other (${app.APFRDCTY})`
+            }))
+        };
+    } catch (error: any) {
+        console.error("[getInvoicePaymentStatus] Error:", error);
+        // Throw with original error for better debugging in console
+        throw new Error(`Failed to fetch payment status: ${error.message || "Unknown error"}`);
     }
 }

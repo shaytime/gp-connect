@@ -1,9 +1,10 @@
 "use client";
 
 import { useEffect, useState, useRef } from "react";
-import { X, FileText, Loader2, Maximize2, Minimize2, Download } from "lucide-react";
+import { X, FileText, Loader2, Maximize2, Minimize2, Download, CreditCard } from "lucide-react";
 import { getInvoiceDetails } from "@/app/customers/actions";
 import { cn } from "@/lib/utils";
+import PaymentStatusModal from "./PaymentStatusModal";
 
 interface InvoiceLine {
     itemNumber: string;
@@ -51,6 +52,7 @@ export default function InvoiceDetailModal({ docNumber, isOpen, onClose }: Invoi
     const [position, setPosition] = useState({ x: 20, y: 20 });
     const [isMaximized, setIsMaximized] = useState(false);
     const [isDragging, setIsDragging] = useState(false);
+    const [isPaymentModalOpen, setIsPaymentModalOpen] = useState(false);
     const dragStartPos = useRef({ x: 0, y: 0 });
     const modalRef = useRef<HTMLDivElement>(null);
 
@@ -319,14 +321,24 @@ export default function InvoiceDetailModal({ docNumber, isOpen, onClose }: Invoi
                 {/* Footer Totals */}
                 {data && (
                     <div className="px-6 py-6 bg-slate-50/80 border-t border-slate-100 flex items-center justify-between">
-                        <button
-                            onClick={exportToCSV}
-                            className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-200 rounded-lg text-sm font-bold text-slate-700 hover:bg-slate-50 transition-colors shadow-sm"
-                        >
-                            <Download size={16} className="text-primary" />
-                            Export to CSV
-                        </button>
+                        <div className="flex items-center gap-3">
+                            <button
+                                onClick={exportToCSV}
+                                className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-200 rounded-lg text-sm font-bold text-slate-700 hover:bg-slate-50 transition-colors shadow-sm"
+                            >
+                                <Download size={16} className="text-primary" />
+                                Export to CSV
+                            </button>
+                            <button
+                                onClick={() => setIsPaymentModalOpen(true)}
+                                className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-200 rounded-lg text-sm font-bold text-blue-600 hover:bg-blue-50 transition-colors shadow-sm"
+                            >
+                                <CreditCard size={16} />
+                                Payment Status
+                            </button>
+                        </div>
                         <div className="w-64 space-y-2">
+                            {/* ... (totals calculation remains same) ... */}
                             <div className="flex justify-between text-xs font-medium text-slate-500">
                                 <span>Subtotal</span>
                                 <span>{new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(data.header.subtotal)}</span>
@@ -355,6 +367,11 @@ export default function InvoiceDetailModal({ docNumber, isOpen, onClose }: Invoi
                     </div>
                 )}
             </div>
+            <PaymentStatusModal
+                docNumber={docNumber}
+                isOpen={isPaymentModalOpen}
+                onClose={() => setIsPaymentModalOpen(false)}
+            />
         </div>
     );
 }

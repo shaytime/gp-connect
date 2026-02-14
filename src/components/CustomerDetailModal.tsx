@@ -24,6 +24,7 @@ interface CustomerDetails {
     billTo: Address | null;
     shipTo: Address | null;
     openAR: number;
+    overdueAR: number;
 }
 
 interface CustomerDetailModalProps {
@@ -130,13 +131,28 @@ export default function CustomerDetailModal({ customerId, isOpen, onClose }: Cus
                                         value={details.contact || "N/A"}
                                     />
                                     <StatCard
-                                        icon={<DollarSign className="text-emerald-500" />}
+                                        icon={<DollarSign className={cn(
+                                            details.overdueAR >= details.openAR && details.openAR > 0 ? "text-red-500" :
+                                                details.overdueAR > 0 ? "text-amber-500" : "text-emerald-500"
+                                        )} />}
                                         label="Current Open AR"
                                         value={new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(details.openAR)}
-                                        className="bg-emerald-50/40 border-emerald-100 ring-2 ring-emerald-500/10 cursor-pointer hover:bg-emerald-50 hover:shadow-md active:scale-95 transition-all group"
-                                        valueClassName="text-emerald-700"
+                                        className={cn(
+                                            "border ring-2 cursor-pointer hover:shadow-md active:scale-95 transition-all group",
+                                            details.overdueAR >= details.openAR && details.openAR > 0 ? "bg-red-50/40 border-red-100 ring-red-500/10 hover:bg-red-50" :
+                                                details.overdueAR > 0 ? "bg-amber-50/40 border-amber-100 ring-amber-500/10 hover:bg-amber-50" :
+                                                    "bg-emerald-50/40 border-emerald-100 ring-emerald-500/10 hover:bg-emerald-50"
+                                        )}
+                                        valueClassName={cn(
+                                            details.overdueAR >= details.openAR && details.openAR > 0 ? "text-red-700" :
+                                                details.overdueAR > 0 ? "text-amber-700" : "text-emerald-700"
+                                        )}
                                         onClick={() => setIsARModalOpen(true)}
-                                        suffix={<ChevronRight size={16} className="text-emerald-400 group-hover:translate-x-1 transition-transform" />}
+                                        suffix={<ChevronRight size={16} className={cn(
+                                            "transition-transform group-hover:translate-x-1",
+                                            details.overdueAR >= details.openAR && details.openAR > 0 ? "text-red-400" :
+                                                details.overdueAR > 0 ? "text-amber-400" : "text-emerald-400"
+                                        )} />}
                                     />
                                 </div>
 
